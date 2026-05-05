@@ -5,8 +5,8 @@ This script uploads device-specific JSON configuration files to Cortex panels au
 ## Prerequisites
 
 - **Python 3.6+** installed
-- **Administrator privileges** (required for network adapter management)
 - **Windows OS** (script uses Windows-specific network commands)
+- **Administrator privileges** (required when the script changes adapter settings)
 
 ## Installation
 
@@ -23,7 +23,7 @@ This script uploads device-specific JSON configuration files to Cortex panels au
 
 ## Usage
 
-**⚠️ IMPORTANT: This script must be run as Administrator**
+**⚠️ IMPORTANT: Run as Administrator when adapter settings are changed**
 
 ### Basic Usage
 ```bash
@@ -37,12 +37,26 @@ python upload_cortex.py 4E11-G01A-Sec1
 
 # Upload config for a device missing device_type (will prompt for type)
 python upload_cortex.py 4C11-R01A-Sec1 28
+
+# Skip default IP attempt and start on the device subnet
+python upload_cortex.py 4E12-G03C-Sec2 14 --a2
+
+# Scan subnets and list responders
+python upload_cortex.py 4E12-G03C-Sec2 14 --pingall
+
+# Diagnose a panel with incorrect IP
+python upload_cortex.py 4E12-G03C-Sec2 14 --diag
 ```
 
 ### Device Types
 - `14` - 14-panel configuration
 - `28` - 28-panel configuration
 - `30` - 30-panel configuration
+
+### Flags
+- `--a2` - Start with the device subnet (skip default IP attempt)
+- `--pingall` - Scan subnets for HTTP responders and show MACs when available
+- `--diag` - Diagnose a panel with incorrect IP, upload corrected config, restart, and verify
 
 ## How It Works
 
@@ -51,6 +65,25 @@ python upload_cortex.py 4C11-R01A-Sec1 28
 3. **Network Management**: Automatically switches network adapters to communicate with devices
 4. **Upload Process**: Uploads configuration via HTTP to the Cortex panel
 5. **Verification**: Confirms successful configuration and device restart
+
+## Subnet Scans
+
+Both `--pingall` and `--diag` scan subnets in this order:
+
+1. The device's expected subnet
+2. Other /24 subnets found in `deviceList.csv`
+3. The default subnet (192.168.7.x)
+
+`--pingall` lists all responding IPs on each subnet. `--diag` scans for Cortex-like responses; if more than one is found on a subnet, it pauses and asks you to rerun the scan after isolating the target panel.
+
+## Diag Mode
+
+`--diag` is intended for panels with incorrect IPs:
+
+1. Scan subnets for a Cortex response
+2. If the correct IP is already set, stop
+3. If one Cortex responder is found, upload the corrected config to that IP
+4. Restart and verify the device at the configured IP
 
 ## Files
 
@@ -63,7 +96,7 @@ python upload_cortex.py 4C11-R01A-Sec1 28
 
 ## Troubleshooting
 
-- **"Must run as Administrator"**: Right-click Command Prompt → "Run as administrator"
+- **"Access denied" or adapter errors**: Right-click Command Prompt → "Run as administrator"
 - **"requests library required"**: Run `pip install requests`
 - **Network errors**: Ensure Ethernet adapter is properly configured
 - **Device not found**: Check `deviceList.csv` for correct device name
