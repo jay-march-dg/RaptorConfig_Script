@@ -20,8 +20,8 @@ import csv
 import json
 import copy
 import time
-import ctypes
 import subprocess
+import concurrent.futures
 import argparse
 
 try:
@@ -40,25 +40,18 @@ TEMPLATE_DIR = SCRIPT_DIR
 
 ADAPTER_NAME = "Ethernet"                      # Windows network adapter name
 DEFAULT_DEVICE_IP = "192.168.7.3"              # Factory default Cortex IP
-LAPTOP_DEFAULT_IP = "192.168.7.254"            # Laptop IP for default subnet
+LAPTOP_DEFAULT_IP = "192.168.7.100"            # Laptop IP for default subnet
 LAPTOP_SUBNET_MASK = "255.255.255.0"           # Subnet mask for all connections
 UPLOAD_ENDPOINT = "/fileupload"
-UPLOAD_FILENAME = "Cortexsettings.json"        # Name sent with the upload
-CONFIG_PROCESS_TIME = 5                         # Seconds to wait after upload
+UPLOAD_FILENAME = "Cortexsettings.json"        # Name sent with the upload                       # Seconds to wait after upload
 CONNECTION_TIMEOUT = 5                          # Seconds before connection gives up
 NETWORK_SETTLE_TIME = 10                         # Seconds to wait after changing adapter
+PINGALL_TIMEOUT = 0.4                            # Seconds per IP for subnet scan
+PINGALL_WORKERS = 32                             # Concurrent workers for pingall scan
+DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
+DIAG_WORKERS = 32                                # Concurrent workers for diag scan
 VALID_PANEL_TYPES = ["14", "28", "30"]
-
-
-# ──────────────────────────────────────────────
-# Admin Check
-# ──────────────────────────────────────────────
-def is_admin():
-    """Check if the script is running with Administrator privileges."""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
-        return False
+DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 
 
 # ──────────────────────────────────────────────
@@ -111,6 +104,51 @@ def derive_laptop_ip(device_ip):
     return ".".join(octets)
 
 
+def subnet_base_from_ip(ip_address):
+    """Return the /24 base (a.b.c) from an IPv4 address, or None if invalid."""
+    octets = ip_address.split(".")
+    if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+        return None
+    return ".".join(octets[:3])
+
+
+def laptop_ip_for_subnet(base):
+    """Return a laptop IP for the given /24 base."""
+    if base == DEFAULT_SUBNET_BASE:
+        return LAPTOP_DEFAULT_IP
+    return f"{base}.254"
+
+
+def collect_subnets_from_devices():
+    """Collect unique /24 subnet bases from devices.csv."""
+    bases = set()
+    if not os.path.exists(DEVICES_CSV):
+        return bases
+
+    with open(DEVICES_CSV, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ip_address = (row.get("ip_address") or "").strip()
+            base = subnet_base_from_ip(ip_address)
+            if base:
+                bases.add(base)
+
+    return bases
+
+
+def build_subnet_scan_order(device_ip):
+    """Return subnet bases ordered: device subnet first, then others (excluding default)."""
+    device_base = subnet_base_from_ip(device_ip)
+    bases = collect_subnets_from_devices()
+    order = []
+    if device_base and device_base != DEFAULT_SUBNET_BASE:
+        order.append(device_base)
+    for base in sorted(bases):
+        if base not in {device_base, DEFAULT_SUBNET_BASE}:
+            order.append(base)
+    return order
+
+
 # ──────────────────────────────────────────────
 # Device Restart
 # ──────────────────────────────────────────────
@@ -122,17 +160,21 @@ def restart_device(target_ip):
     try:
         url = f"http://{target_ip}/restart"
         data = {"restart": "restart"}
-        
+
         print(f"  Sending restart command to {target_ip}...")
         response = requests.post(url, json=data, timeout=10)
-        
+
         if response.status_code == 200:
             print(f"  ✓ Restart command sent successfully")
             return True
         else:
             print(f"  ✗ Restart command failed with status: {response.status_code}")
             return False
-            
+
+    except requests.exceptions.Timeout:
+        # Some devices stop responding immediately after receiving restart
+        print(f"  ✓ Restart command sent (device restarting - response timed out)")
+        return True
     except requests.exceptions.ConnectionError as e:
         # Connection abort is expected when device restarts immediately
         if "Connection aborted" in str(e) or "forcibly closed" in str(e):
@@ -205,6 +247,161 @@ def verify_device_at_ip(target_ip):
     except requests.exceptions.RequestException as e:
         print(f"  ✗ No response from device at {target_ip}")
         return False
+
+
+def get_mac_from_arp(target_ip):
+    """Return MAC address from ARP table for the given IP, or None."""
+    try:
+        result = subprocess.run(
+            f"arp -a {target_ip}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        output = result.stdout
+        for line in output.splitlines():
+            if target_ip in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    return parts[1]
+        return None
+    except Exception:
+        return None
+
+
+def scan_subnet_for_cortex_base(base):
+    """
+    Scan a /24 subnet (x.x.x.1-255) with a quick HTTP GET.
+    Returns a list of IPs that responded.
+    """
+    if not base:
+        print("  ✗ Scan skipped: invalid device IP format.")
+        return []
+
+    print(f"\n  → Scanning subnet {base}.0/24 for Cortex...")
+
+    def probe_ip(target_ip):
+        try:
+            response = requests.get(f"http://{target_ip}", timeout=PINGALL_TIMEOUT)
+            if response.status_code:
+                content = response.text.lower()
+                is_cortex = any(indicator in content for indicator in ["cortex", "fileupload", "system.html"])
+                mac = get_mac_from_arp(target_ip)
+                return {
+                    "ip": target_ip,
+                    "status": response.status_code,
+                    "is_cortex": is_cortex,
+                    "mac": mac,
+                }
+        except requests.exceptions.RequestException:
+            return None
+        return None
+
+    found = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PINGALL_WORKERS) as executor:
+        futures = [
+            executor.submit(probe_ip, f"{base}.{last}")
+            for last in range(1, 256)
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if not result:
+                continue
+            mac_display = result["mac"] if result["mac"] else "unknown"
+            if result["is_cortex"]:
+                print(
+                    f"  ✓ Cortex-like response at {result['ip']} "
+                    f"(status {result['status']}, mac {mac_display})"
+                )
+            else:
+                print(
+                    f"  ✓ Response at {result['ip']} "
+                    f"(status {result['status']}, mac {mac_display})"
+                )
+            found.append(result["ip"])
+
+    if not found:
+        print("  ✗ Scan complete: no responses found on this subnet.")
+    return found
+
+
+def find_cortex_ips_on_subnet_base(base):
+    """
+    Quickly find Cortex-like responses on a /24 subnet.
+    Returns a list of matching IPs.
+    """
+    if not base:
+        print("  ✗ Diag scan skipped: invalid device IP format.")
+        return []
+
+    print(f"\n  → Diag scan on subnet {base}.0/24 ...")
+
+    def probe_ip(target_ip):
+        try:
+            response = requests.get(f"http://{target_ip}", timeout=DIAG_TIMEOUT)
+            if response.status_code:
+                content = response.text.lower()
+                if any(indicator in content for indicator in ["cortex", "fileupload", "system.html"]):
+                    return target_ip
+        except requests.exceptions.RequestException:
+            return None
+        return None
+
+    found = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DIAG_WORKERS) as executor:
+        futures = [
+            executor.submit(probe_ip, f"{base}.{last}")
+            for last in range(1, 256)
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                print(f"  ✓ Cortex-like response at {result}")
+                found.append(result)
+
+    if not found:
+        print("  ✗ Diag scan complete: no Cortex response found on this subnet.")
+    elif len(found) > 1:
+        print(f"  ⚠ Multiple Cortex responders found: {', '.join(found)}")
+    return found
+
+
+def restart_and_verify(upload_ip, device_ip, switch_to_device_subnet):
+    """Restart the device and verify it at the configured IP."""
+    if not restart_device(upload_ip):
+        print("  ✗ Failed to trigger restart")
+        return False
+
+    restart_countdown = 15
+    print(f"  Waiting {restart_countdown}s for device restart...")
+
+    if switch_to_device_subnet:
+        print(f"  → Switching to device subnet while device restarts...\n")
+        laptop_ip = derive_laptop_ip(device_ip)
+        if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
+            print("  ✗ Could not configure adapter for device subnet.")
+            return False
+
+        remaining_wait = max(0, restart_countdown - NETWORK_SETTLE_TIME)
+        for i in range(remaining_wait, 0, -1):
+            print(f"  Restarting in {i}s...", end='\r')
+            time.sleep(1)
+    else:
+        for i in range(restart_countdown, 0, -1):
+            print(f"  Restarting in {i}s...", end='\r')
+            time.sleep(1)
+
+    print("  ✓ Restart countdown complete")
+
+    if verify_device_at_ip(device_ip):
+        print(f"  ✓ Device successfully restarted at configured IP: {device_ip}")
+        return True
+
+    print(f"  ⚠ Device not verified at {device_ip} after restart")
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -379,7 +576,7 @@ def attempt_upload(target_ip, config_data):
 # ──────────────────────────────────────────────
 # Smart Upload — try default IP, then device IP
 # ──────────────────────────────────────────────
-def upload_config(device_ip, config_data):
+def upload_config(device_ip, config_data, prefer_device_subnet=False):
     """
     Two-stage upload with automatic Ethernet switching and restart:
       1. Set adapter to default subnet → verify Cortex device → upload config → trigger restart
@@ -387,6 +584,10 @@ def upload_config(device_ip, config_data):
       3. After restart completes, verify device at configured IP
       4. Keep adapter at final configuration
     """
+
+    if prefer_device_subnet:
+        print("\n  → Skipping default IP attempt. Starting with device subnet...")
+        return attempt_device_ip(device_ip, config_data)
 
     # ── Attempt 1: Default IP ──
     print(f"\n  ── Attempt 1: Default IP ({DEFAULT_DEVICE_IP}) ──")
@@ -406,23 +607,24 @@ def upload_config(device_ip, config_data):
                 time.sleep(1)  # Brief pause before restart
 
                 if restart_device(DEFAULT_DEVICE_IP):
-                    # Wait for restart countdown (15s) to complete
                     restart_countdown = 15
                     print(f"  Waiting {restart_countdown}s for device restart...")
-                    for i in range(restart_countdown, 0, -1):
-                        print(f"  Restarting in {i}s...", end='\r')
-                        time.sleep(1)
-                    print(f"  ✓ Restart countdown complete")
 
-                    # Now switch to device subnet and verify
-                    print(f"  → Switching to device subnet to verify new configuration...\n")
-
+                    # Switch to device subnet during the restart window
+                    print(f"  → Switching to device subnet while device restarts...\n")
                     laptop_ip = derive_laptop_ip(device_ip)
 
                     if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
                         print(f"  ✗ Could not configure adapter for device subnet.")
                         print(f"  ✓ Upload and restart completed but verification failed.")
                         return True
+
+                    # Finish any remaining restart wait time after adapter settles
+                    remaining_wait = max(0, restart_countdown - NETWORK_SETTLE_TIME)
+                    for i in range(remaining_wait, 0, -1):
+                        print(f"  Restarting in {i}s...", end='\r')
+                        time.sleep(1)
+                    print(f"  ✓ Restart countdown complete")
 
                     # Verify the device at its configured IP
                     if verify_device_at_ip(device_ip):
@@ -447,6 +649,19 @@ def upload_config(device_ip, config_data):
     # Default IP check failed - try device IP directly
     print(f"  → Attempting direct connection to {device_ip}...\n")
 
+    if attempt_device_ip(device_ip, config_data):
+        return True
+
+    # Both attempts failed
+    print(f"\n  ✗ FAILED: Could not find and configure Cortex device.")
+    print(f"    • Checked: {DEFAULT_DEVICE_IP} (default subnet)")
+    print(f"    • Checked: {device_ip} (device subnet)")
+    print(f"    • Verify the device is powered on and network-connected.")
+    return False
+
+
+def attempt_device_ip(device_ip, config_data):
+    """Attempt upload and restart using the device's assigned IP/subnet."""
     # ── Attempt 2: Device's assigned IP ──
     print(f"  ── Attempt 2: Device IP ({device_ip}) ──")
 
@@ -467,10 +682,12 @@ def upload_config(device_ip, config_data):
                 time.sleep(1)  # Brief pause before restart
 
                 if restart_device(device_ip):
-                    # Wait for restart countdown (15s) to complete
                     restart_countdown = 15
                     print(f"  Waiting {restart_countdown}s for device restart...")
-                    for i in range(restart_countdown, 0, -1):
+
+                    # Adapter is already on the device subnet; just wait out restart window
+                    remaining_wait = max(0, restart_countdown)
+                    for i in range(remaining_wait, 0, -1):
                         print(f"  Restarting in {i}s...", end='\r')
                         time.sleep(1)
                     print(f"  ✓ Restart countdown complete")
@@ -491,11 +708,6 @@ def upload_config(device_ip, config_data):
     else:
         print(f"  ✗ No device responding at {device_ip}")
 
-    # Both attempts failed
-    print(f"\n  ✗ FAILED: Could not find and configure Cortex device.")
-    print(f"    • Checked: {DEFAULT_DEVICE_IP} (default subnet)")
-    print(f"    • Checked: {device_ip} (device subnet)")
-    print(f"    • Verify the device is powered on and network-connected.")
     return False
 
 
@@ -516,20 +728,26 @@ def main():
         nargs='?',
         help="Device type (14, 28, or 30) if not specified in devices.csv",
     )
+    parser.add_argument(
+        "--a2",
+        action="store_true",
+        help="Start with the device subnet (skip default IP attempt)",
+    )
+    parser.add_argument(
+        "--pingall",
+        action="store_true",
+        help="Scan the device subnet for a Cortex response and report the IP",
+    )
+    parser.add_argument(
+        "--diag",
+        action="store_true",
+        help="Find current IP, upload corrected config, restart, and verify",
+    )
     args = parser.parse_args()
 
     print(f"\n{'='*50}")
     print(f"  CORTEX CONFIG UPLOADER")
     print(f"{'='*50}\n")
-
-    # ── Admin check ──
-    if not is_admin():
-        print("  ✗ ERROR: This script must be run as Administrator.")
-        print("    Right-click Command Prompt → 'Run as administrator'")
-        print("    Then re-run this script.\n")
-        sys.exit(1)
-
-    print("  ✓ Running as Administrator\n")
 
     # 1 — Look up device
     device = load_device(args.device_name)
@@ -562,6 +780,32 @@ def main():
     print(f"  Template:    Cortexsettings ({device_type}).json")
     print(f"  Default IP:  {DEFAULT_DEVICE_IP}")
 
+    if args.pingall:
+        print("\n  → Running subnet scan (--pingall)")
+        subnet_order = build_subnet_scan_order(ip_address)
+
+        for base in subnet_order:
+            laptop_ip = laptop_ip_for_subnet(base)
+            if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
+                print(f"  ✗ Could not configure adapter for subnet {base}.0/24.")
+                sys.exit(1)
+
+            found_ips = scan_subnet_for_cortex_base(base)
+            if found_ips:
+                print(f"  ✓ Scan complete. Responsive IPs: {', '.join(found_ips)}")
+                sys.exit(0)
+
+        print("  → No responses found on deviceList subnets. Trying default subnet...")
+        if not set_adapter_ip(LAPTOP_DEFAULT_IP, LAPTOP_SUBNET_MASK):
+            print("  ✗ Could not configure adapter for default subnet.")
+            sys.exit(1)
+
+        found_ips = scan_subnet_for_cortex_base(DEFAULT_SUBNET_BASE)
+        if found_ips:
+            print(f"  ✓ Scan complete. Responsive IPs: {', '.join(found_ips)}")
+            sys.exit(0)
+        sys.exit(1)
+
     # 2 — Load template
     config = load_template(device_type)
 
@@ -569,12 +813,74 @@ def main():
     config = update_config(config, ip_address, gateway)
     print(f"\n  ✓ Config updated with device IP & gateway")
 
+    if args.diag:
+        print("\n  → Running diag mode (--diag)")
+        subnet_order = build_subnet_scan_order(ip_address)
+        while True:
+            found_any = False
+            for base in subnet_order:
+                laptop_ip = laptop_ip_for_subnet(base)
+                if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
+                    print(f"  ✗ Could not configure adapter for subnet {base}.0/24.")
+                    sys.exit(1)
+
+                found_ips = find_cortex_ips_on_subnet_base(base)
+                if not found_ips:
+                    continue
+
+                found_any = True
+                if ip_address in found_ips:
+                    print(f"  ✓ Correct IP is already set: {ip_address}")
+                    sys.exit(0)
+
+                if len(found_ips) > 1:
+                    print("  ✗ Multiple Cortex responders found. Aborting diag to avoid wrong upload.")
+                    print("  → Isolate the target panel and run --diag again.")
+                    rerun = input("  Run diag scan again now? (y/N): ").strip().lower()
+                    if rerun in {"y", "yes"}:
+                        break
+                    sys.exit(1)
+
+                print(f"  ⚠ Found device at {found_ips[0]} (expected {ip_address})")
+
+                found_ip = found_ips[0]
+                result = attempt_upload(found_ip, config)
+                if result != "success":
+                    print("  ✗ Upload failed during diag")
+                    sys.exit(1)
+
+                print("  → Config uploaded successfully. Preparing for restart...\n")
+                time.sleep(1)
+
+                if restart_and_verify(found_ip, ip_address, switch_to_device_subnet=True):
+                    sys.exit(0)
+                sys.exit(1)
+
+            if found_any:
+                continue
+            break
+
+        print("  → No Cortex response found on deviceList subnets. Trying default IP...")
+        if not set_adapter_ip(LAPTOP_DEFAULT_IP, LAPTOP_SUBNET_MASK):
+            print("  ✗ Could not configure adapter for default subnet.")
+            sys.exit(1)
+
+        result = attempt_upload(DEFAULT_DEVICE_IP, config)
+        if result != "success":
+            print("  ✗ Upload failed on default IP during diag")
+            sys.exit(1)
+
+        print("  → Config uploaded successfully. Preparing for restart...\n")
+        time.sleep(1)
+
+        if restart_and_verify(DEFAULT_DEVICE_IP, ip_address, switch_to_device_subnet=True):
+            sys.exit(0)
+        sys.exit(1)
+
     # 4 — Upload (with automatic adapter switching)
-    success = upload_config(ip_address, config)
+    success = upload_config(ip_address, config, prefer_device_subnet=args.a2)
 
     if success:
-        print(f"\n  Waiting {CONFIG_PROCESS_TIME}s for device to process...")
-        time.sleep(CONFIG_PROCESS_TIME)
         print(f"  ✓ Done! '{device['device_name']}' configured successfully.")
     else:
         print(f"\n  ✗ Configuration of '{device['device_name']}' failed.")
