@@ -50,6 +50,7 @@ PINGALL_TIMEOUT = 0.4                            # Seconds per IP for subnet sca
 PINGALL_WORKERS = 32                             # Concurrent workers for pingall scan
 DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
 DIAG_WORKERS = 32                                # Concurrent workers for diag scan
+CONFIGALL_WORKERS = 24                           # Concurrent workers for --configall
 VALID_PANEL_TYPES = ["14", "28", "30"]
 DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 RDP_MODE = False
@@ -139,6 +140,103 @@ def collect_subnets_from_devices():
                 bases.add(base)
 
     return bases
+
+
+def is_valid_ipv4(ip_address):
+    """Return True if ip_address is a valid IPv4 address."""
+    octets = ip_address.split(".")
+    return len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets)
+
+
+def load_devices_filtered(prefix, device_type):
+    """Load devices that match name prefix and device type from devices.csv."""
+    if not os.path.exists(DEVICES_CSV):
+        print(f"  ✗ ERROR: devices.csv not found at:\n    {DEVICES_CSV}")
+        sys.exit(1)
+
+    devices = []
+    with open(DEVICES_CSV, "r", newline="") as f:
+        reader = csv.DictReader(f)
+
+        required_headers = {"device_name", "device_type", "ip_address"}
+        if not required_headers.issubset(set(reader.fieldnames or [])):
+            print(f"  ✗ ERROR: devices.csv must have headers: {required_headers}")
+            sys.exit(1)
+
+        for row in reader:
+            name = (row.get("device_name") or "").strip()
+            dtype = (row.get("device_type") or "").strip()
+            ip_address = (row.get("ip_address") or "").strip()
+
+            if not name.startswith(prefix):
+                continue
+            if dtype != device_type:
+                continue
+            if not is_valid_ipv4(ip_address):
+                print(f"  ⚠ Skipping '{name}': invalid IP '{ip_address}'")
+                continue
+
+            devices.append({
+                "device_name": name,
+                "device_type": dtype,
+                "ip_address": ip_address,
+            })
+
+    return devices
+
+
+def verify_devices_by_prefix(prefix, device_type):
+    """Verify devices matching prefix/type by checking HTTP response at their IPs."""
+    devices = load_devices_filtered(prefix, device_type)
+    if not devices:
+        print(f"  ✗ No devices found for prefix '{prefix}' with type '{device_type}'.")
+        sys.exit(1)
+
+    print(f"\n  → Verifying {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
+
+    def verify_one(device):
+        ip_address = device["ip_address"]
+        ok = verify_device_at_ip(ip_address)
+        return device["device_name"], ok
+
+    success = []
+    failed = []
+
+    if RDP_MODE:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
+            futures = [executor.submit(verify_one, device) for device in devices]
+            for future in concurrent.futures.as_completed(futures):
+                name, ok = future.result()
+                if ok:
+                    success.append(name)
+                else:
+                    failed.append(name)
+    else:
+        devices_by_base = {}
+        for device in devices:
+            base = subnet_base_from_ip(device["ip_address"])
+            devices_by_base.setdefault(base, []).append(device)
+
+        for base in sorted(devices_by_base.keys()):
+            laptop_ip = laptop_ip_for_subnet(base)
+            if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
+                print(f"  ✗ Could not configure adapter for subnet {base}.0/24.")
+                sys.exit(1)
+
+            batch = devices_by_base[base]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
+                futures = [executor.submit(verify_one, device) for device in batch]
+                for future in concurrent.futures.as_completed(futures):
+                    name, ok = future.result()
+                    if ok:
+                        success.append(name)
+                    else:
+                        failed.append(name)
+
+    print(f"\n  ✓ Verified: {len(success)}")
+    print(f"  ✗ Failed: {len(failed)}")
+    if failed:
+        print(f"  ⚠ Failed devices: {', '.join(failed)}")
 
 
 def build_subnet_scan_order(device_ip):
@@ -753,6 +851,11 @@ def main():
         action="store_true",
         help="Run without changing local Ethernet settings",
     )
+    parser.add_argument(
+        "--configall",
+        action="store_true",
+        help="Verify devices by name prefix and type (no uploads)",
+    )
     args = parser.parse_args()
 
     global RDP_MODE
@@ -761,6 +864,17 @@ def main():
     print(f"\n{'='*50}")
     print(f"  CORTEX CONFIG UPLOADER")
     print(f"{'='*50}\n")
+
+    if args.configall:
+        if not args.device_type:
+            print("  ✗ ERROR: --configall requires a device_type (14, 28, or 30).")
+            sys.exit(1)
+        if args.device_type not in VALID_PANEL_TYPES:
+            print(f"  ✗ ERROR: Invalid device_type '{args.device_type}'. Must be one of: {VALID_PANEL_TYPES}")
+            sys.exit(1)
+
+        verify_devices_by_prefix(args.device_name, args.device_type)
+        sys.exit(0)
 
     # 1 — Look up device
     device = load_device(args.device_name)
