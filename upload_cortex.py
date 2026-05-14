@@ -38,7 +38,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICES_CSV = os.path.join(SCRIPT_DIR, "deviceList.csv")
 TEMPLATE_DIR = SCRIPT_DIR
 
-ADAPTER_NAME = "Ethernet"                      # Windows network adapter name
+ADAPTER_NAME = "Ethernet 6"                      # Windows network adapter name
 DEFAULT_DEVICE_IP = "192.168.7.3"              # Factory default Cortex IP
 LAPTOP_DEFAULT_IP = "192.168.7.100"            # Laptop IP for default subnet
 LAPTOP_SUBNET_MASK = "255.255.255.0"           # Subnet mask for all connections
@@ -52,6 +52,7 @@ DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
 DIAG_WORKERS = 32                                # Concurrent workers for diag scan
 VALID_PANEL_TYPES = ["14", "28", "30"]
 DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
+RDP_MODE = False
 
 
 # ──────────────────────────────────────────────
@@ -59,6 +60,10 @@ DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 # ──────────────────────────────────────────────
 def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME):
     """Set a static IP on the Windows Ethernet adapter using netsh."""
+    if RDP_MODE:
+        print(f"  [RDP] Skipping adapter change: {adapter} → {ip} / {mask}")
+        return True
+
     print(f"  Setting {adapter} to {ip} / {mask} ...")
 
     cmd = f'netsh interface ip set address name="{adapter}" static {ip} {mask}'
@@ -743,7 +748,15 @@ def main():
         action="store_true",
         help="Find current IP, upload corrected config, restart, and verify",
     )
+    parser.add_argument(
+        "--rdp",
+        action="store_true",
+        help="Run without changing local Ethernet settings",
+    )
     args = parser.parse_args()
+
+    global RDP_MODE
+    RDP_MODE = args.rdp
 
     print(f"\n{'='*50}")
     print(f"  CORTEX CONFIG UPLOADER")
