@@ -50,7 +50,7 @@ PINGALL_TIMEOUT = 0.4                            # Seconds per IP for subnet sca
 PINGALL_WORKERS = 32                             # Concurrent workers for pingall scan
 DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
 DIAG_WORKERS = 32                                # Concurrent workers for diag scan
-CONFIGALL_WORKERS = 24                           # Concurrent workers for --configall
+VERIFYALL_WORKERS = 24                           # Concurrent workers for --verifyall
 VALID_PANEL_TYPES = ["14", "28", "30", "26S(3x3)", "10S(5x5)", "26S(1x1)"]  # Valid device types for template selection
 DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 RDP_MODE = False
@@ -148,8 +148,8 @@ def is_valid_ipv4(ip_address):
     return len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets)
 
 
-def load_devices_filtered(prefix, device_type):
-    """Load devices that match name prefix and device type from devices.csv."""
+def load_devices_filtered(prefix, device_type=None):
+    """Load devices that match name prefix (and optional device type) from devices.csv."""
     if not os.path.exists(DEVICES_CSV):
         print(f"  ✗ ERROR: devices.csv not found at:\n    {DEVICES_CSV}")
         sys.exit(1)
@@ -170,7 +170,7 @@ def load_devices_filtered(prefix, device_type):
 
             if not name.startswith(prefix):
                 continue
-            if dtype != device_type:
+            if device_type and dtype != device_type:
                 continue
             if not is_valid_ipv4(ip_address):
                 print(f"  ⚠ Skipping '{name}': invalid IP '{ip_address}'")
@@ -185,14 +185,20 @@ def load_devices_filtered(prefix, device_type):
     return devices
 
 
-def verify_devices_by_prefix(prefix, device_type):
-    """Verify devices matching prefix/type by checking HTTP response at their IPs."""
+def verify_devices_by_prefix(prefix, device_type=None):
+    """Verify devices matching prefix (and optional type) by checking HTTP response at their IPs."""
     devices = load_devices_filtered(prefix, device_type)
     if not devices:
-        print(f"  ✗ No devices found for prefix '{prefix}' with type '{device_type}'.")
+        if device_type:
+            print(f"  ✗ No devices found for prefix '{prefix}' with type '{device_type}'.")
+        else:
+            print(f"  ✗ No devices found for prefix '{prefix}'.")
         sys.exit(1)
 
-    print(f"\n  → Verifying {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
+    if device_type:
+        print(f"\n  → Verifying {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
+    else:
+        print(f"\n  → Verifying {len(devices)} device(s) for prefix '{prefix}' (all types)")
 
     def verify_one(device):
         ip_address = device["ip_address"]
@@ -203,7 +209,7 @@ def verify_devices_by_prefix(prefix, device_type):
     failed = []
 
     if RDP_MODE:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=VERIFYALL_WORKERS) as executor:
             futures = [executor.submit(verify_one, device) for device in devices]
             for future in concurrent.futures.as_completed(futures):
                 name, ok = future.result()
@@ -224,7 +230,7 @@ def verify_devices_by_prefix(prefix, device_type):
                 sys.exit(1)
 
             batch = devices_by_base[base]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=VERIFYALL_WORKERS) as executor:
                 futures = [executor.submit(verify_one, device) for device in batch]
                 for future in concurrent.futures.as_completed(futures):
                     name, ok = future.result()
@@ -852,9 +858,9 @@ def main():
         help="Run without changing local Ethernet settings",
     )
     parser.add_argument(
-        "--configall",
+        "--verifyall",
         action="store_true",
-        help="Verify devices by name prefix and type (no uploads)",
+        help="Verify devices by name prefix (optionally filtered by type) without uploading",
     )
     args = parser.parse_args()
 
@@ -865,11 +871,8 @@ def main():
     print(f"  CORTEX CONFIG UPLOADER")
     print(f"{'='*50}\n")
 
-    if args.configall:
-        if not args.device_type:
-            print("  ✗ ERROR: --configall requires a device_type (14, 28, or 30).")
-            sys.exit(1)
-        if args.device_type not in VALID_PANEL_TYPES:
+    if args.verifyall:
+        if args.device_type and args.device_type not in VALID_PANEL_TYPES:
             print(f"  ✗ ERROR: Invalid device_type '{args.device_type}'. Must be one of: {VALID_PANEL_TYPES}")
             sys.exit(1)
 
