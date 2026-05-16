@@ -51,7 +51,7 @@ PINGALL_WORKERS = 32                             # Concurrent workers for pingal
 DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
 DIAG_WORKERS = 32                                # Concurrent workers for diag scan
 CONFIGALL_WORKERS = 24                           # Concurrent workers for --configall
-VALID_PANEL_TYPES = ["14", "28", "30"]
+VALID_PANEL_TYPES = ["14", "28", "30", "26S(3x3)", "10S(5x5)"]  # Valid device types for template selection
 DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 RDP_MODE = False
 
@@ -829,7 +829,7 @@ def main():
     parser.add_argument(
         "device_type",
         nargs='?',
-        help="Device type (14, 28, or 30) if not specified in devices.csv",
+        help="Device type (14, 28, or 30, 10S(5x5), 26S(3x3)) if not specified in devices.csv",
     )
     parser.add_argument(
         "--a2",
