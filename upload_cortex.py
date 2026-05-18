@@ -888,7 +888,7 @@ def main():
     if args.open:
         device = load_device(args.device_name)
         ip_address = device["ip_address"]
-        url = f"https://{ip_address}"
+        url = f"{ip_address}"
         print(f"  → Opening {url} ...")
         webbrowser.open(url)
         sys.exit(0)
