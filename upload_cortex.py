@@ -859,6 +859,11 @@ def main():
         help="Run without changing local Ethernet settings",
     )
     parser.add_argument(
+        "--reboot",
+        action="store_true",
+        help="Restart the device and verify after reboot",
+    )
+    parser.add_argument(
         "--verifyall",
         action="store_true",
         help="Verify devices by name prefix (optionally filtered by type) without uploading",
@@ -923,6 +928,16 @@ def main():
     print(f"  Gateway:     {gateway}")
     print(f"  Template:    Cortexsettings ({device_type}).json")
     print(f"  Default IP:  {DEFAULT_DEVICE_IP}")
+
+    if args.reboot:
+        laptop_ip = derive_laptop_ip(ip_address)
+        if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
+            print("  ✗ Could not configure adapter for device subnet.")
+            sys.exit(1)
+
+        if restart_and_verify(ip_address, ip_address, switch_to_device_subnet=False):
+            sys.exit(0)
+        sys.exit(1)
 
     if args.pingall:
         print("\n  → Running subnet scan (--pingall)")
