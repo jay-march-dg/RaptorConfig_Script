@@ -39,7 +39,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICES_CSV = os.path.join(SCRIPT_DIR, "deviceList.csv")
 TEMPLATE_DIR = SCRIPT_DIR
 
-ADAPTER_NAME = "Ethernet"                      # Windows network adapter name
+ADAPTER_NAME = "Ethernet 6"                      # Windows network adapter name
 DEFAULT_DEVICE_IP = "192.168.7.3"              # Factory default Cortex IP
 LAPTOP_DEFAULT_IP = "192.168.7.100"            # Laptop IP for default subnet
 LAPTOP_SUBNET_MASK = "255.255.255.0"           # Subnet mask for all connections
