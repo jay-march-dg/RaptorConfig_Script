@@ -23,6 +23,7 @@ import time
 import subprocess
 import concurrent.futures
 import argparse
+import webbrowser
 
 try:
     import requests
@@ -862,6 +863,11 @@ def main():
         action="store_true",
         help="Verify devices by name prefix (optionally filtered by type) without uploading",
     )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the device IP in a web browser (https://<ip>)",
+    )
     args = parser.parse_args()
 
     global RDP_MODE
@@ -877,6 +883,14 @@ def main():
             sys.exit(1)
 
         verify_devices_by_prefix(args.device_name, args.device_type)
+        sys.exit(0)
+
+    if args.open:
+        device = load_device(args.device_name)
+        ip_address = device["ip_address"]
+        url = f"https://{ip_address}"
+        print(f"  → Opening {url} ...")
+        webbrowser.open(url)
         sys.exit(0)
 
     # 1 — Look up device
