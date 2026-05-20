@@ -39,7 +39,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICES_CSV = os.path.join(SCRIPT_DIR, "deviceList.csv")
 TEMPLATE_DIR = SCRIPT_DIR
 
-ADAPTER_NAME = "Ethernet 6"                      # Windows network adapter name
+ADAPTER_NAME = "Ethernet"                      # Windows network adapter name
 DEFAULT_DEVICE_IP = "192.168.7.3"              # Factory default Cortex IP
 LAPTOP_DEFAULT_IP = "192.168.7.100"            # Laptop IP for default subnet
 LAPTOP_SUBNET_MASK = "255.255.255.0"           # Subnet mask for all connections
@@ -52,6 +52,7 @@ PINGALL_WORKERS = 32                             # Concurrent workers for pingal
 DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
 DIAG_WORKERS = 32                                # Concurrent workers for diag scan
 VERIFYALL_WORKERS = 24                           # Concurrent workers for --verifyall
+CONFIGALL_WORKERS = 4                            # Concurrent workers for --configall
 VALID_PANEL_TYPES = ["14", "28", "30", "26S(3x3)", "10S(5x5)", "26S(1x1)"]  # Valid device types for template selection
 DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 RDP_MODE = False
@@ -242,6 +243,78 @@ def verify_devices_by_prefix(prefix, device_type=None):
 
     print(f"\n  ✓ Verified: {len(success)}")
     print(f"  ✗ Failed: {len(failed)}")
+    if failed:
+        print(f"  ⚠ Failed devices: {', '.join(failed)}")
+
+
+def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
+    """Upload config and restart devices matching prefix/type."""
+    devices = load_devices_filtered(prefix, device_type)
+    if not devices:
+        print(f"  ✗ No devices found for prefix '{prefix}' with type '{device_type}'.")
+        sys.exit(1)
+
+    template = load_template(device_type)
+    print(f"\n  → Uploading {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
+
+    def process_device(device):
+        name = device["device_name"]
+        ip_address = device["ip_address"]
+        config = update_config(template, ip_address, derive_gateway(ip_address))
+
+        if not prefer_device_subnet:
+            ok = upload_config(ip_address, config, prefer_device_subnet=False)
+            return name, ok
+
+        if not ping_device(ip_address):
+            return name, False
+        if not verify_device_at_ip(ip_address):
+            return name, False
+
+        result = attempt_upload(ip_address, config)
+        if result != "success":
+            return name, False
+
+        ok = restart_and_verify(ip_address, ip_address, switch_to_device_subnet=False)
+        return name, ok
+
+    success = []
+    failed = []
+
+    if RDP_MODE:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
+            futures = [executor.submit(process_device, device) for device in devices]
+            for future in concurrent.futures.as_completed(futures):
+                name, ok = future.result()
+                if ok:
+                    success.append(name)
+                else:
+                    failed.append(name)
+    else:
+        devices_by_base = {}
+        for device in devices:
+            base = subnet_base_from_ip(device["ip_address"])
+            devices_by_base.setdefault(base, []).append(device)
+
+        for base in sorted(devices_by_base.keys()):
+            laptop_ip = laptop_ip_for_subnet(base)
+            if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
+                print(f"  ✗ Could not configure adapter for subnet {base}.0/24.")
+                failed.extend([d["device_name"] for d in devices_by_base[base]])
+                continue
+
+            batch = devices_by_base[base]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
+                futures = [executor.submit(process_device, device) for device in batch]
+                for future in concurrent.futures.as_completed(futures):
+                    name, ok = future.result()
+                    if ok:
+                        success.append(name)
+                    else:
+                        failed.append(name)
+
+    print(f"\n  ✓ Uploaded/verified: {len(success)}")
+    print(f"  ✗ Failed/unreachable: {len(failed)}")
     if failed:
         print(f"  ⚠ Failed devices: {', '.join(failed)}")
 
@@ -864,6 +937,11 @@ def main():
         help="Restart the device and verify after reboot",
     )
     parser.add_argument(
+        "--configall",
+        action="store_true",
+        help="Upload config/restart for devices by name prefix and type",
+    )
+    parser.add_argument(
         "--verifyall",
         action="store_true",
         help="Verify devices by name prefix (optionally filtered by type) without uploading",
@@ -881,6 +959,19 @@ def main():
     print(f"\n{'='*50}")
     print(f"  CORTEX CONFIG UPLOADER")
     print(f"{'='*50}\n")
+
+    if args.configall:
+        if not args.device_type:
+            print("  ✗ ERROR: --configall requires a device_type.")
+            sys.exit(1)
+        if args.device_type not in VALID_PANEL_TYPES:
+            print(f"  ✗ ERROR: Invalid device_type '{args.device_type}'. Must be one of: {VALID_PANEL_TYPES}")
+            sys.exit(1)
+        if not args.a2:
+            print("  ⚠ --configall runs on device subnets only. Use --a2 to acknowledge this behavior.")
+
+        upload_devices_by_prefix(args.device_name, args.device_type, prefer_device_subnet=True)
+        sys.exit(0)
 
     if args.verifyall:
         if args.device_type and args.device_type not in VALID_PANEL_TYPES:
