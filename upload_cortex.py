@@ -267,13 +267,15 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
     print(f"\n  → Uploading {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
 
     total = len(devices)
+    completed = 0
     success = []
     unreachable = []
     upload_failed = []
     verify_failed = []
     lock = threading.Lock()
 
-    def record_result(name, status):
+    def record_result(name, ip_address, status):
+        nonlocal completed
         if status == "uploaded+verified":
             success.append(name)
         elif status == "unreachable":
@@ -282,10 +284,11 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
             upload_failed.append(name)
         else:
             verify_failed.append(name)
-
-    def record_upload_sent(name, ip_address):
         with lock:
-            print(f"  ✓ Upload sent to {name} ({ip_address})")
+            completed += 1
+            print(f"  {name} ({ip_address}) - {status}")
+            if completed % 10 == 0 or completed == total:
+                print(f"  Progress: {completed}/{total}")
 
     def process_device(device):
         name = device["device_name"]
@@ -295,31 +298,29 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
         if not prefer_device_subnet:
             with contextlib.redirect_stdout(io.StringIO()):
                 ok = upload_config(ip_address, config, prefer_device_subnet=False)
-            return name, "uploaded+verified" if ok else "verify_failed"
+            return name, ip_address, "uploaded+verified" if ok else "verify_failed"
 
         with contextlib.redirect_stdout(io.StringIO()):
             if not ping_device(ip_address):
-                return name, "unreachable"
+                return name, ip_address, "unreachable"
             if not verify_device_at_ip(ip_address):
-                return name, "unreachable"
+                return name, ip_address, "unreachable"
 
             result = attempt_upload(ip_address, config)
 
         if result != "success":
-            return name, "upload_failed"
-
-        record_upload_sent(name, ip_address)
+            return name, ip_address, "upload_failed"
 
         with contextlib.redirect_stdout(io.StringIO()):
             ok = restart_and_verify(ip_address, ip_address, switch_to_device_subnet=False)
-        return name, "uploaded+verified" if ok else "verify_failed"
+        return name, ip_address, "uploaded+verified" if ok else "verify_failed"
 
     if RDP_MODE:
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
             futures = [executor.submit(process_device, device) for device in devices]
             for future in concurrent.futures.as_completed(futures):
-                name, status = future.result()
-                record_result(name, status)
+                name, ip_address, status = future.result()
+                record_result(name, ip_address, status)
     else:
         devices_by_base = {}
         for device in devices:
@@ -330,15 +331,15 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
             laptop_ip = laptop_ip_for_subnet(base)
             if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK, quiet=True):
                 for device in devices_by_base[base]:
-                    record_result(device["device_name"], "verify_failed")
+                    record_result(device["device_name"], device["ip_address"], "verify_failed")
                 continue
 
             batch = devices_by_base[base]
             with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
                 futures = [executor.submit(process_device, device) for device in batch]
                 for future in concurrent.futures.as_completed(futures):
-                    name, status = future.result()
-                    record_result(name, status)
+                    name, ip_address, status = future.result()
+                    record_result(name, ip_address, status)
 
     print(f"\n  ✓ Uploaded/verified: {len(success)}")
     print(f"  ⚠ Unreachable: {len(unreachable)}")
