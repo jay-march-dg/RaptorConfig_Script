@@ -24,6 +24,8 @@ import subprocess
 import concurrent.futures
 import argparse
 import webbrowser
+import io
+import contextlib
 
 try:
     import requests
@@ -52,7 +54,7 @@ PINGALL_WORKERS = 32                             # Concurrent workers for pingal
 DIAG_TIMEOUT = 0.3                               # Seconds per IP for diag scan
 DIAG_WORKERS = 32                                # Concurrent workers for diag scan
 VERIFYALL_WORKERS = 24                           # Concurrent workers for --verifyall
-CONFIGALL_WORKERS = 4                            # Concurrent workers for --configall
+CONFIGALL_WORKERS = 12                           # Concurrent workers for --configall
 VALID_PANEL_TYPES = ["14", "28", "30", "26S(3x3)", "10S(5x5)", "26S(1x1)"]  # Valid device types for template selection
 DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 RDP_MODE = False
@@ -61,13 +63,15 @@ RDP_MODE = False
 # ──────────────────────────────────────────────
 # Network Adapter Management
 # ──────────────────────────────────────────────
-def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME):
+def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME, quiet=False):
     """Set a static IP on the Windows Ethernet adapter using netsh."""
     if RDP_MODE:
-        print(f"  [RDP] Skipping adapter change: {adapter} → {ip} / {mask}")
+        if not quiet:
+            print(f"  [RDP] Skipping adapter change: {adapter} → {ip} / {mask}")
         return True
 
-    print(f"  Setting {adapter} to {ip} / {mask} ...")
+    if not quiet:
+        print(f"  Setting {adapter} to {ip} / {mask} ...")
 
     cmd = f'netsh interface ip set address name="{adapter}" static {ip} {mask}'
 
@@ -82,19 +86,23 @@ def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME):
 
         if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip()
-            print(f"  ✗ Failed to set adapter IP: {error_msg}")
+            if not quiet:
+                print(f"  ✗ Failed to set adapter IP: {error_msg}")
             return False
 
-        print(f"  ✓ Adapter set to {ip}")
-        print(f"  Waiting {NETWORK_SETTLE_TIME}s for adapter to settle...")
+        if not quiet:
+            print(f"  ✓ Adapter set to {ip}")
+            print(f"  Waiting {NETWORK_SETTLE_TIME}s for adapter to settle...")
         time.sleep(NETWORK_SETTLE_TIME)
         return True
 
     except subprocess.TimeoutExpired:
-        print(f"  ✗ netsh command timed out.")
+        if not quiet:
+            print(f"  ✗ netsh command timed out.")
         return False
     except Exception as e:
-        print(f"  ✗ Error setting adapter: {e}")
+        if not quiet:
+            print(f"  ✗ Error setting adapter: {e}")
         return False
 
 
@@ -256,40 +264,53 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
 
     template = load_template(device_type)
     print(f"\n  → Uploading {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
+    print("  → Minimal output mode: showing progress only")
+
+    total = len(devices)
+    completed = 0
+    success = []
+    unreachable = []
+    failed = []
+
+    def record_result(name, status):
+        nonlocal completed
+        completed += 1
+        if status == "ok":
+            success.append(name)
+        elif status == "unreachable":
+            unreachable.append(name)
+        else:
+            failed.append(name)
+        print(f"  [{completed}/{total}] {name} - {status}")
 
     def process_device(device):
         name = device["device_name"]
         ip_address = device["ip_address"]
         config = update_config(template, ip_address, derive_gateway(ip_address))
 
-        if not prefer_device_subnet:
-            ok = upload_config(ip_address, config, prefer_device_subnet=False)
-            return name, ok
+        with contextlib.redirect_stdout(io.StringIO()):
+            if not prefer_device_subnet:
+                ok = upload_config(ip_address, config, prefer_device_subnet=False)
+                return name, "ok" if ok else "failed"
 
-        if not ping_device(ip_address):
-            return name, False
-        if not verify_device_at_ip(ip_address):
-            return name, False
+            if not ping_device(ip_address):
+                return name, "unreachable"
+            if not verify_device_at_ip(ip_address):
+                return name, "unreachable"
 
-        result = attempt_upload(ip_address, config)
-        if result != "success":
-            return name, False
+            result = attempt_upload(ip_address, config)
+            if result != "success":
+                return name, "failed"
 
-        ok = restart_and_verify(ip_address, ip_address, switch_to_device_subnet=False)
-        return name, ok
-
-    success = []
-    failed = []
+            ok = restart_and_verify(ip_address, ip_address, switch_to_device_subnet=False)
+            return name, "ok" if ok else "failed"
 
     if RDP_MODE:
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
             futures = [executor.submit(process_device, device) for device in devices]
             for future in concurrent.futures.as_completed(futures):
-                name, ok = future.result()
-                if ok:
-                    success.append(name)
-                else:
-                    failed.append(name)
+                name, status = future.result()
+                record_result(name, status)
     else:
         devices_by_base = {}
         for device in devices:
@@ -298,25 +319,25 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
 
         for base in sorted(devices_by_base.keys()):
             laptop_ip = laptop_ip_for_subnet(base)
-            if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK):
-                print(f"  ✗ Could not configure adapter for subnet {base}.0/24.")
-                failed.extend([d["device_name"] for d in devices_by_base[base]])
+            if not set_adapter_ip(laptop_ip, LAPTOP_SUBNET_MASK, quiet=True):
+                for device in devices_by_base[base]:
+                    record_result(device["device_name"], "failed")
                 continue
 
             batch = devices_by_base[base]
             with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
                 futures = [executor.submit(process_device, device) for device in batch]
                 for future in concurrent.futures.as_completed(futures):
-                    name, ok = future.result()
-                    if ok:
-                        success.append(name)
-                    else:
-                        failed.append(name)
+                    name, status = future.result()
+                    record_result(name, status)
 
     print(f"\n  ✓ Uploaded/verified: {len(success)}")
-    print(f"  ✗ Failed/unreachable: {len(failed)}")
+    print(f"  ⚠ Unreachable: {len(unreachable)}")
+    print(f"  ✗ Failed: {len(failed)}")
+    if unreachable:
+        print(f"  ⚠ Unreachable devices: {', '.join(unreachable)}")
     if failed:
-        print(f"  ⚠ Failed devices: {', '.join(failed)}")
+        print(f"  ✗ Failed devices: {', '.join(failed)}")
 
 
 def build_subnet_scan_order(device_ip):
