@@ -26,6 +26,7 @@ import argparse
 import webbrowser
 import io
 import contextlib
+import threading
 
 try:
     import requests
@@ -264,18 +265,15 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
 
     template = load_template(device_type)
     print(f"\n  → Uploading {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
-    print("  → Minimal output mode: showing progress only")
 
     total = len(devices)
-    completed = 0
     success = []
     unreachable = []
     upload_failed = []
     verify_failed = []
+    lock = threading.Lock()
 
     def record_result(name, status):
-        nonlocal completed
-        completed += 1
         if status == "uploaded+verified":
             success.append(name)
         elif status == "unreachable":
@@ -284,29 +282,37 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
             upload_failed.append(name)
         else:
             verify_failed.append(name)
-        print(f"  [{completed}/{total}] {name} - {status}")
+
+    def record_upload_sent(name, ip_address):
+        with lock:
+            print(f"  ✓ Upload sent to {name} ({ip_address})")
 
     def process_device(device):
         name = device["device_name"]
         ip_address = device["ip_address"]
         config = update_config(template, ip_address, derive_gateway(ip_address))
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            if not prefer_device_subnet:
+        if not prefer_device_subnet:
+            with contextlib.redirect_stdout(io.StringIO()):
                 ok = upload_config(ip_address, config, prefer_device_subnet=False)
-                return name, "uploaded+verified" if ok else "verify_failed"
+            return name, "uploaded+verified" if ok else "verify_failed"
 
+        with contextlib.redirect_stdout(io.StringIO()):
             if not ping_device(ip_address):
                 return name, "unreachable"
             if not verify_device_at_ip(ip_address):
                 return name, "unreachable"
 
             result = attempt_upload(ip_address, config)
-            if result != "success":
-                return name, "upload_failed"
 
+        if result != "success":
+            return name, "upload_failed"
+
+        record_upload_sent(name, ip_address)
+
+        with contextlib.redirect_stdout(io.StringIO()):
             ok = restart_and_verify(ip_address, ip_address, switch_to_device_subnet=False)
-            return name, "uploaded+verified" if ok else "verify_failed"
+        return name, "uploaded+verified" if ok else "verify_failed"
 
     if RDP_MODE:
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIGALL_WORKERS) as executor:
@@ -336,14 +342,12 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
 
     print(f"\n  ✓ Uploaded/verified: {len(success)}")
     print(f"  ⚠ Unreachable: {len(unreachable)}")
-    print(f"  ✗ Upload failed: {len(upload_failed)}")
-    print(f"  ✗ Verify failed: {len(verify_failed)}")
+    print(f"  ✗ Failed: {len(upload_failed) + len(verify_failed)}")
     if unreachable:
         print(f"  ⚠ Unreachable devices: {', '.join(unreachable)}")
-    if upload_failed:
-        print(f"  ✗ Upload failed devices: {', '.join(upload_failed)}")
-    if verify_failed:
-        print(f"  ✗ Verify failed devices: {', '.join(verify_failed)}")
+    if upload_failed or verify_failed:
+        failed_devices = upload_failed + verify_failed
+        print(f"  ✗ Failed devices: {', '.join(failed_devices)}")
 
 
 def build_subnet_scan_order(device_ip):
