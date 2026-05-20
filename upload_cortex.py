@@ -267,7 +267,6 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
     print(f"\n  → Uploading {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
 
     total = len(devices)
-    completed = 0
     success = []
     unreachable = []
     upload_failed = []
@@ -275,7 +274,6 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
     lock = threading.Lock()
 
     def record_result(name, ip_address, status):
-        nonlocal completed
         if status == "uploaded+verified":
             success.append(name)
         elif status == "unreachable":
@@ -285,10 +283,7 @@ def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
         else:
             verify_failed.append(name)
         with lock:
-            completed += 1
             print(f"  {name} ({ip_address}) - {status}")
-            if completed % 10 == 0 or completed == total:
-                print(f"  Progress: {completed}/{total}")
 
     def process_device(device):
         name = device["device_name"]
