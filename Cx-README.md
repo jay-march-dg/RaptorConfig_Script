@@ -69,6 +69,12 @@ Verify all devices with a prefix for a specific type:
 python upload_cortex.py 4C 28 --verifyall (TO BE USED IN RDP ALONG WITH --rdp COMMAND)
 ```
 
+Upload config/restart for all devices with a prefix and type:
+
+```bash
+python upload_cortex.py 4C 30 --a2 --configall (EWS STATION ONLY, MUST USE --rdp)
+```
+
 Open the device in a browser:
 
 ```bash
@@ -87,6 +93,9 @@ python upload_cortex.py 4C-R07B-Sec1 --open
   - Do not change the local Ethernet adapter IP
 - --reboot
   - Send restart command and verify the device after reboot
+- --configall
+  - Upload config/restart for all devices matching a prefix and type (EWS station only, must use --rdp)
+  - WARNING: This is dangerous and will push a new config to all online devices in scope
 - --verifyall
   - Verify multiple devices by name prefix (optional device_type filter)
 - --open
