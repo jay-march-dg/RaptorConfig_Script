@@ -47,6 +47,8 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 
+from cortex_settings import DEFAULT_ADAPTER_NAME, load_adapter_name, save_adapter_name
+
 APP_ENCODING = locale.getpreferredencoding(False) or "utf-8"
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -55,7 +57,7 @@ DEFAULT_HEADERS = ["device_name", "device_type", "ip_address", "gateway"]
 DEFAULT_SCRIPT_NAME = "upload_cortex.py"
 DEFAULT_DEVICE_LIST_NAME = "deviceList.csv"
 
-FALLBACK_ADAPTER_NAME = "Ethernet 6"
+FALLBACK_ADAPTER_NAME = DEFAULT_ADAPTER_NAME
 FALLBACK_DEFAULT_DEVICE_IP = "192.168.7.3"
 FALLBACK_PANEL_TYPES = ["14", "28", "30", "26S(3x3)", "10S(5x5)", "26S(1x1)"]
 
@@ -741,7 +743,7 @@ class MainWindow(QMainWindow):
         root.addWidget(paths_group)
 
         self.adapter_edit = QLineEdit()
-        self.adapter_edit.setReadOnly(True)
+        self.adapter_edit.setPlaceholderText(DEFAULT_ADAPTER_NAME)
 
         self.default_ip_edit = QLineEdit()
         self.default_ip_edit.setReadOnly(True)
@@ -761,7 +763,7 @@ class MainWindow(QMainWindow):
 
         note = QLabel(
             "Notes:\n"
-            "• Adapter name is currently hardcoded in upload_cortex.py.\n"
+            "• Adapter name is shared by the GUI and upload_cortex.py.\n"
             "• The Open Web UI button runs: upload_cortex.py <device_name> --open\n"
             "• --configall is built with --a2 automatically by the GUI."
         )
@@ -873,6 +875,7 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> None:
         self.script_edit.setText(self.settings.value("script_path", ""))
+        self.adapter_edit.setText(self.settings.value("adapter_name", load_adapter_name(DEFAULT_ADAPTER_NAME)))
 
         self.use_device_ip_check.setChecked(self.settings.value("use_device_ip", False, type=bool))
         self.rdp_check.setChecked(self.settings.value("rdp", False, type=bool))
@@ -919,9 +922,11 @@ class MainWindow(QMainWindow):
 
         self.device_list_edit.setText(str(script_dir / DEFAULT_DEVICE_LIST_NAME))
         self.template_dir_edit.setText(str(script_dir))
-        self.adapter_edit.setText(self.metadata.adapter_name)
         self.default_ip_edit.setText(self.metadata.default_device_ip)
         self.default_ip_value.setText(self.metadata.default_device_ip)
+
+        if not self.adapter_edit.text().strip():
+            self.adapter_edit.setText(load_adapter_name(DEFAULT_ADAPTER_NAME))
 
         self._refresh_device_type_combo()
         self.valid_types_edit.setText(", ".join(self.metadata.valid_panel_types))
@@ -955,7 +960,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Settings saved.", 3000)
 
     def _save_settings(self) -> None:
+        adapter_name = self.adapter_edit.text().strip() or DEFAULT_ADAPTER_NAME
+        self.adapter_edit.setText(adapter_name)
+        save_adapter_name(adapter_name)
+
         self.settings.setValue("script_path", self.script_edit.text().strip())
+        self.settings.setValue("adapter_name", adapter_name)
         self.settings.setValue("use_device_ip", self.use_device_ip_check.isChecked())
         self.settings.setValue("rdp", self.rdp_check.isChecked())
         self.settings.setValue("selected_device", self.device_combo.currentText().strip())

@@ -27,6 +27,8 @@ import webbrowser
 import locale
 import builtins
 
+from cortex_settings import DEFAULT_ADAPTER_NAME, load_adapter_name, normalize_adapter_name, save_adapter_name
+
 try:
     import requests
 except ImportError:
@@ -41,7 +43,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICES_CSV = os.path.join(SCRIPT_DIR, "deviceList.csv")
 TEMPLATE_DIR = SCRIPT_DIR
 
-ADAPTER_NAME = "Ethernet 6"                      # Windows network adapter name
+ADAPTER_NAME = load_adapter_name(DEFAULT_ADAPTER_NAME)  # Windows network adapter name
 DEFAULT_DEVICE_IP = "192.168.7.3"              # Factory default Cortex IP
 LAPTOP_DEFAULT_IP = "192.168.7.100"            # Laptop IP for default subnet
 LAPTOP_SUBNET_MASK = "255.255.255.0"           # Subnet mask for all connections
@@ -110,8 +112,9 @@ builtins.print = safe_print
 # ──────────────────────────────────────────────
 # Network Adapter Management
 # ──────────────────────────────────────────────
-def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME):
+def set_adapter_ip(ip, mask, adapter=None):
     """Set a static IP on the Windows Ethernet adapter using netsh."""
+    adapter = normalize_adapter_name(adapter or ADAPTER_NAME)
     if RDP_MODE:
         safe_print(f"  [RDP] Skipping adapter change: {adapter} -> {ip} / {mask}")
         return True
@@ -968,6 +971,7 @@ def main():
     )
     parser.add_argument(
         "device_name",
+        nargs="?",
         help="Device name as listed in devices.csv",
     )
     parser.add_argument(
@@ -996,6 +1000,11 @@ def main():
         help="Run without changing local Ethernet settings",
     )
     parser.add_argument(
+        "--set-adapter",
+        metavar="NAME",
+        help="Save and use a specific Windows adapter name",
+    )
+    parser.add_argument(
         "--reboot",
         action="store_true",
         help="Restart the device and verify after reboot",
@@ -1017,12 +1026,23 @@ def main():
     )
     args = parser.parse_args()
 
-    global RDP_MODE
+    global RDP_MODE, ADAPTER_NAME
     RDP_MODE = args.rdp
+
+    if args.set_adapter is not None:
+        ADAPTER_NAME = save_adapter_name(args.set_adapter)
+
+    if args.device_name is None:
+        if args.set_adapter is not None:
+            print(f"  Adapter:     {ADAPTER_NAME}")
+            sys.exit(0)
+        print("  ✗ ERROR: device_name is required unless you are using --set-adapter.")
+        sys.exit(1)
 
     print(f"\n{'='*50}")
     print(f"  CORTEX CONFIG UPLOADER")
     print(f"{'='*50}\n")
+    print(f"  Adapter:     {ADAPTER_NAME}")
 
     if args.configall:
         if not args.device_type:
