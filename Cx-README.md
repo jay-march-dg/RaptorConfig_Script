@@ -1,13 +1,30 @@
 # Cx README - Cortex Config Upload Script
 
-This guide is for Cx teams using upload_cortex.py to configure and troubleshoot Cortex panels.
+This guide is for Cx teams using the Cortex upload tools to configure, verify, and troubleshoot panels.
 
-IF A PANEL DOES NOT HAVE AN IP YET YOU MUST UNPLUG THE NETWORK DROP, use --pingall to verify all the responders at a port if needed
+If a panel does not have an IP yet, unplug the network drop before scanning. Use `--pingall` to verify responders at a port when needed.
 
-MAKE SURE THE SCRIPT IS CONFIGURING THE ETHERNET PORT BEING USED ON YOUR LAPTOP (i.e: Ethernet, Ethernet 2, Ethernet 6, etc...) 
-- edit this on line 42 in upload_cortex.py if needed, save file and move on.
+Make sure the tool is configured for the Ethernet adapter being used on your laptop. The adapter name is now shared between the GUI and CLI, and it falls back to the last saved value or `Ethernet`.
 
 ## Quick Start
+
+### Recommended: GUI
+
+Run the GUI from the project folder:
+
+```bash
+python cortex_gui.py
+```
+
+The GUI is the easiest way to:
+
+- View and manage `deviceList.csv`
+- Run single-device upload, reboot, and verify workflows
+- Run prefix-based `--verifyall` and `--configall` operations
+- Change the adapter name from the Settings tab
+- View upload logs and status
+
+### CLI
 
 Run from the project folder:
 
@@ -15,10 +32,18 @@ Run from the project folder:
 python upload_cortex.py <device_name>
 ```
 
-If device_type is missing in deviceList.csv, pass it:
+If `device_type` is missing in `deviceList.csv`, pass it:
 
 ```bash
 python upload_cortex.py <device_name> <device_type>
+```
+
+To verify or configure by prefix:
+
+```bash
+python upload_cortex.py 4A --verifyall
+python upload_cortex.py 4A 30 --verifyall
+python upload_cortex.py 4A 30 --configall
 ```
 
 ## Device Types
@@ -38,6 +63,12 @@ Template files are named like:
 - Cortexsettings (26S(3x3)).json
 
 ## Common Tasks
+
+Open the GUI:
+
+```bash
+python cortex_gui.py
+```
 
 Upload config and restart:
 
@@ -60,19 +91,19 @@ python upload_cortex.py 4C-R07B-Sec1 --reboot
 Verify all devices with a prefix (all types):
 
 ```bash
-python upload_cortex.py 4C --verifyall (TO BE USED IN RDP ALONG WITH --rdp COMMAND)
+python upload_cortex.py 4C --verifyall
 ```
 
 Verify all devices with a prefix for a specific type:
 
 ```bash
-python upload_cortex.py 4C 28 --verifyall (TO BE USED IN RDP ALONG WITH --rdp COMMAND)
+python upload_cortex.py 4C 28 --verifyall
 ```
 
 Upload config/restart for all devices with a prefix and type:
 
 ```bash
-python upload_cortex.py 4C 30 --a2 --configall (EWS STATION ONLY, MUST USE --rdp)
+python upload_cortex.py 4C 30 --configall
 ```
 
 Open the device in a browser:
@@ -94,12 +125,14 @@ python upload_cortex.py 4C-R07B-Sec1 --open
 - --reboot
   - Send restart command and verify the device after reboot
 - --configall
-  - Upload config/restart for all devices matching a prefix and type (EWS station only, must use --rdp)
-  - WARNING: This is dangerous and will push a new config to all online devices in scope
+  - Upload config/restart for all devices matching a prefix and type
+  - WARNING: This will push a new config to all online devices in scope
 - --verifyall
   - Verify multiple devices by name prefix (optional device_type filter)
 - --open
   - Open the device IP in the default browser
+- --set-adapter NAME
+  - Save and use a Windows adapter name for future runs
 
 ## How Subnet Scans Work
 
@@ -115,8 +148,10 @@ Both --pingall and --diag scan subnets in this order:
 
 - Script uses Windows netsh to change the adapter IP.
 - You must run as Administrator when adapter changes are required.
-- Adapter name in the script: Ethernet
-- Use --rdp if you are connected through RDP or do not want adapter changes.
+- Adapter name is shared between the GUI and CLI.
+- Use the Settings tab in `cortex_gui.py` to update the adapter name.
+- Use `--set-adapter NAME` if you want to save the adapter name from the CLI.
+- Use `--rdp` if you are connected through RDP or do not want adapter changes.
 
 ## Troubleshooting
 
@@ -134,6 +169,9 @@ Both --pingall and --diag scan subnets in this order:
 ## Files
 
 - upload_cortex.py
+- cortex_gui.py
+- cortex_settings.py
+- cortex_adapter_settings.json
 - deviceList.csv
 - Cortexsettings (<type>).json
 - requirements.txt
