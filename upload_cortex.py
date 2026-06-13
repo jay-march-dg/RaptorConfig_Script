@@ -24,6 +24,8 @@ import subprocess
 import concurrent.futures
 import argparse
 import webbrowser
+import locale
+import builtins
 
 try:
     import requests
@@ -58,16 +60,63 @@ DEFAULT_SUBNET_BASE = ".".join(DEFAULT_DEVICE_IP.split(".")[:3])
 RDP_MODE = False
 
 
+_ORIGINAL_PRINT = builtins.print
+
+
+def safe_text(value):
+    """Return text that is safe for legacy Windows consoles."""
+    if value is None:
+        return ""
+
+    replacements = {
+        "✓": "OK",
+        "✔": "OK",
+        "✗": "X",
+        "⚠": "!",
+        "→": "->",
+        "←": "<-",
+        "•": "*",
+        "—": "-",
+        "–": "-",
+        "’": "'",
+        "“": '"',
+        "”": '"',
+        "…": "...",
+    }
+
+    text = str(value)
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+
+    try:
+        text.encode(sys.stdout.encoding or locale.getpreferredencoding(False) or "cp1252", errors="strict")
+    except (AttributeError, UnicodeEncodeError, LookupError):
+        text = text.encode("ascii", errors="ignore").decode("ascii")
+
+    return text
+
+
+def safe_print(*args, **kwargs):
+    """Print ASCII-safe text to stdout."""
+    if "end" not in kwargs:
+        kwargs["end"] = "\n"
+    text = " ".join(safe_text(arg) for arg in args)
+    _ORIGINAL_PRINT(text, **kwargs)
+
+
+builtins.print = safe_print
+
+
 # ──────────────────────────────────────────────
 # Network Adapter Management
 # ──────────────────────────────────────────────
 def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME):
     """Set a static IP on the Windows Ethernet adapter using netsh."""
     if RDP_MODE:
-        print(f"  [RDP] Skipping adapter change: {adapter} → {ip} / {mask}")
+        safe_print(f"  [RDP] Skipping adapter change: {adapter} -> {ip} / {mask}")
         return True
 
-    print(f"  Setting {adapter} to {ip} / {mask} ...")
+    safe_print(f"  Setting {adapter} to {ip} / {mask} ...")
 
     cmd = f'netsh interface ip set address name="{adapter}" static {ip} {mask}'
 
@@ -82,19 +131,19 @@ def set_adapter_ip(ip, mask, adapter=ADAPTER_NAME):
 
         if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip()
-            print(f"  ✗ Failed to set adapter IP: {error_msg}")
+            safe_print(f"  X Failed to set adapter IP: {error_msg}")
             return False
 
-        print(f"  ✓ Adapter set to {ip}")
-        print(f"  Waiting {NETWORK_SETTLE_TIME}s for adapter to settle...")
+        safe_print(f"  OK Adapter set to {ip}")
+        safe_print(f"  Waiting {NETWORK_SETTLE_TIME}s for adapter to settle...")
         time.sleep(NETWORK_SETTLE_TIME)
         return True
 
     except subprocess.TimeoutExpired:
-        print(f"  ✗ netsh command timed out.")
+        safe_print("  X netsh command timed out.")
         return False
     except Exception as e:
-        print(f"  ✗ Error setting adapter: {e}")
+        safe_print(f"  X Error setting adapter: {e}")
         return False
 
 
@@ -150,6 +199,16 @@ def is_valid_ipv4(ip_address):
     return len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets)
 
 
+def normalize_csv_header(name):
+    """Strip UTF-8 BOM and whitespace from CSV header names."""
+    return (name or "").lstrip("\ufeff").strip()
+
+
+def normalize_csv_row(row):
+    """Return a CSV row with normalized header names for safe lookups."""
+    return {normalize_csv_header(key): (value or "").strip() for key, value in (row or {}).items()}
+
+
 def load_devices_filtered(prefix, device_type=None):
     """Load devices that match name prefix (and optional device type) from devices.csv."""
     if not os.path.exists(DEVICES_CSV):
@@ -157,25 +216,27 @@ def load_devices_filtered(prefix, device_type=None):
         sys.exit(1)
 
     devices = []
-    with open(DEVICES_CSV, "r", newline="") as f:
+    with open(DEVICES_CSV, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
 
         required_headers = {"device_name", "device_type", "ip_address"}
-        if not required_headers.issubset(set(reader.fieldnames or [])):
-            print(f"  ✗ ERROR: devices.csv must have headers: {required_headers}")
+        fieldnames = [normalize_csv_header(name) for name in (reader.fieldnames or []) if normalize_csv_header(name)]
+        if not required_headers.issubset(set(fieldnames)):
+            safe_print(f"  X ERROR: devices.csv must have headers: {required_headers}")
             sys.exit(1)
 
-        for row in reader:
-            name = (row.get("device_name") or "").strip()
-            dtype = (row.get("device_type") or "").strip()
-            ip_address = (row.get("ip_address") or "").strip()
+        for raw_row in reader:
+            row = normalize_csv_row(raw_row)
+            name = row.get("device_name", "")
+            dtype = row.get("device_type", "")
+            ip_address = row.get("ip_address", "")
 
             if not name.startswith(prefix):
                 continue
             if device_type and dtype != device_type:
                 continue
             if not is_valid_ipv4(ip_address):
-                print(f"  ⚠ Skipping '{name}': invalid IP '{ip_address}'")
+                safe_print(f"  ! Skipping '{name}': invalid IP '{ip_address}'")
                 continue
 
             devices.append({
@@ -192,15 +253,15 @@ def verify_devices_by_prefix(prefix, device_type=None):
     devices = load_devices_filtered(prefix, device_type)
     if not devices:
         if device_type:
-            print(f"  ✗ No devices found for prefix '{prefix}' with type '{device_type}'.")
+            safe_print(f"  X No devices found for prefix '{prefix}' with type '{device_type}'.")
         else:
-            print(f"  ✗ No devices found for prefix '{prefix}'.")
+            safe_print(f"  X No devices found for prefix '{prefix}'.")
         sys.exit(1)
 
     if device_type:
-        print(f"\n  → Verifying {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
+        safe_print(f"\n  -> Verifying {len(devices)} device(s) for prefix '{prefix}' and type '{device_type}'")
     else:
-        print(f"\n  → Verifying {len(devices)} device(s) for prefix '{prefix}' (all types)")
+        safe_print(f"\n  -> Verifying {len(devices)} device(s) for prefix '{prefix}' (all types)")
 
     def verify_one(device):
         ip_address = device["ip_address"]
@@ -241,10 +302,10 @@ def verify_devices_by_prefix(prefix, device_type=None):
                     else:
                         failed.append(name)
 
-    print(f"\n  ✓ Verified: {len(success)}")
-    print(f"  ✗ Failed: {len(failed)}")
+    safe_print(f"\n  OK Verified: {len(success)}")
+    safe_print(f"  X Failed: {len(failed)}")
     if failed:
-        print(f"  ⚠ Failed devices: {', '.join(failed)}")
+        safe_print(f"  ! Failed devices: {', '.join(failed)}")
 
 
 def upload_devices_by_prefix(prefix, device_type, prefer_device_subnet=True):
@@ -596,21 +657,23 @@ def load_device(device_name):
         print(f"  ✗ ERROR: devices.csv not found at:\n    {DEVICES_CSV}")
         sys.exit(1)
 
-    with open(DEVICES_CSV, "r", newline="") as f:
+    with open(DEVICES_CSV, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
 
         # Validate CSV headers
         required_headers = {"device_name", "device_type", "ip_address"}
-        if not required_headers.issubset(set(reader.fieldnames or [])):
-            print(f"  ✗ ERROR: devices.csv must have headers: {required_headers}")
+        fieldnames = [normalize_csv_header(name) for name in (reader.fieldnames or []) if normalize_csv_header(name)]
+        if not required_headers.issubset(set(fieldnames)):
+            safe_print(f"  X ERROR: devices.csv must have headers: {required_headers}")
             sys.exit(1)
 
-        for row in reader:
-            if row["device_name"].strip() == device_name.strip():
+        for raw_row in reader:
+            row = normalize_csv_row(raw_row)
+            if row.get("device_name", "").strip() == device_name.strip():
                 device = {
-                    "device_name": row["device_name"].strip(),
-                    "device_type": row["device_type"].strip(),
-                    "ip_address": row["ip_address"].strip(),
+                    "device_name": row.get("device_name", "").strip(),
+                    "device_type": row.get("device_type", "").strip(),
+                    "ip_address": row.get("ip_address", "").strip(),
                 }
 
                 # Validate IP format
@@ -634,11 +697,12 @@ def update_device_type(device_name, device_type):
 
     rows = []
     updated = False
-    with open(DEVICES_CSV, "r", newline="") as f:
+    with open(DEVICES_CSV, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
-        for row in reader:
-            if row["device_name"].strip() == device_name.strip():
+        for raw_row in reader:
+            row = normalize_csv_row(raw_row)
+            if row.get("device_name", "").strip() == device_name.strip():
                 row["device_type"] = device_type
                 updated = True
             rows.append(row)
@@ -647,7 +711,7 @@ def update_device_type(device_name, device_type):
         print(f"  ✗ ERROR: Device '{device_name}' not found in devices.csv")
         sys.exit(1)
 
-    with open(DEVICES_CSV, "w", newline="") as f:
+    with open(DEVICES_CSV, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
